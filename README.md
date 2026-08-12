@@ -1,4 +1,4 @@
-# Fisher Width — Experiments
+# Fisher Width Complexity — Experiments
 
 Reproducibility code for the paper:
 
