@@ -1,443 +1,578 @@
+#!/usr/bin/env python3
+"""Experiment 2: estimator accuracy and stability.
+
+Paper role
+----------
+This script supports Section 7.3. It computes three sub-experiments, while the main-paper figure displays 2.1 and 2.3:
+
+  2.1 Rank-k approximation on the SAME Fisher matrix.
+      For each seed s, form G^(s), truncate that very matrix to G_k^(s), and
+      compare
+
+          w_{G^(s)}(T) - w_{G_k^(s)}(T)
+
+      with sqrt(lambda_{k+1}(G^(s))) w(T). This directly matches the matrix
+      pairing in Proposition 6.1.
+
+  2.2 Fixed-base-point empirical convergence diagnostic.
+      Fit one theta_ref once, keep it fixed, define a large-sample conditional
+      Fisher reference G_ref at theta_ref, and estimate G_n on subsamples at
+      the same theta_ref. This removes the earlier confounding from refitting
+      theta at every n. Because the matrices may still be rank deficient, this
+      is presented as a convergence diagnostic rather than a literal test of
+      the positive-definite corollary.
+
+  2.3 Structured approximation.
+      Compare the full conditional Fisher with its diagonal approximation and
+      with the trace upper scale sqrt(Tr(G)). Also compute the deterministic
+      Theorem 3.1 stability bound for the diagonal approximation.
+
+The binary logistic model has NO intercept, matching p=784 in the paper.
+
+Outputs
+-------
+  <outdir>/exp2_figure.pdf   # main-paper two-panel figure
+  <outdir>/exp2_figure.png   # main-paper two-panel figure
+  <outdir>/exp2_results.npz
+  <outdir>/exp2_summary.txt
+  <outdir>/exp2_rankk.csv
+  <outdir>/exp2_convergence.csv
+  <outdir>/exp2_structured.csv
+
+Run
+---
+  python exp2_estimator_accuracy.py
+  python exp2_estimator_accuracy.py --quick   # smoke test only
 """
-Experiment 2: Estimator Accuracy and Stability
-===============================================
-Validates:
-  - Corollary 3.2 (Low-Rank Fisher Approximation):
-        |w_G(T) - w_{G_k}(T)| <= sqrt(lambda_{k+1}) * w(T)
-  - Corollary 3.4 (Empirical Fisher Stability):
-        |w_{G_hat_n}(T) - w_F(T)| <= eps_n * w(T)
-        where eps_n -> 0 at rate O(1/sqrt(n))
 
-Three sub-experiments:
-  2.1  Rank-k approximation: error vs sqrt(lambda_{k+1})
-  2.2  Data convergence: Fisher width error vs n
-  2.3  Structured approximations: diagonal vs full Fisher
+from __future__ import annotations
 
-Model: Binary logistic regression on MNIST (0 vs 1)
-       p=784, full Fisher matrix available
-"""
+import argparse
+import csv
+import gzip
+import struct
+import urllib.request
+from pathlib import Path
 
-import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.special import gammaln
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from scipy.special import gammaln
-import struct, gzip, os, time
 
-# ── config ────────────────────────────────────────────────────────
-MASTER_SEED  = 42
-N_SEEDS      = 10
-N_TRAIN_REF  = 10_000   # reference (large n) for ground truth
-N_TEST       = 2_000
-B_MC         = 5_000    # MC samples for width estimation
-LAM_FIX      = 0.01     # fixed regularization for sub-experiments 2.1, 2.3
-RANKS        = [1, 2, 5, 10, 20, 30, 50, 100, 200, 392]  # k values
-N_VALUES     = [100, 200, 500, 1000, 2000, 5000, 10_000]  # for data convergence
 
-os.makedirs('results', exist_ok=True)
+MNIST_BASE_URL = "https://storage.googleapis.com/cvdf-datasets/mnist"
+MNIST_FILES = [
+    "train-images-idx3-ubyte.gz",
+    "train-labels-idx1-ubyte.gz",
+    "t10k-images-idx3-ubyte.gz",
+    "t10k-labels-idx1-ubyte.gz",
+]
 
-# ─────────────────────────────────────────────────────────────────
-# 1.  Load MNIST
-# ─────────────────────────────────────────────────────────────────
-def read_idx(path):
-    with gzip.open(path, 'rb') as f:
-        magic = struct.unpack('>I', f.read(4))[0]
-        n     = struct.unpack('>I', f.read(4))[0]
-        if magic == 2051:
-            r, c = struct.unpack('>II', f.read(8))
-            return np.frombuffer(f.read(),np.uint8).reshape(n,r*c).astype(np.float64)
-        elif magic == 2049:
-            return np.frombuffer(f.read(),np.uint8).astype(int)
+MASTER_SEED = 42
+LAM_FIX = 0.01
+RANKS = [1, 2, 5, 10, 20, 30, 50, 100, 200, 392]
+N_VALUES = [100, 200, 500, 1000, 2000, 5000, 10_000]
 
-print("Loading MNIST ...")
-base  = 'mnist_data'
-X_all = np.concatenate([
-    read_idx(os.path.join(base,'train-images-idx3-ubyte.gz')),
-    read_idx(os.path.join(base,'t10k-images-idx3-ubyte.gz'))
-])
-y_all = np.concatenate([
-    read_idx(os.path.join(base,'train-labels-idx1-ubyte.gz')),
-    read_idx(os.path.join(base,'t10k-labels-idx1-ubyte.gz'))
-])
-mask  = (y_all==0)|(y_all==1)
-X_bin = X_all[mask];  y_bin = y_all[mask]
-d = X_bin.shape[1]
-print(f"Binary (0 vs 1): {X_bin.shape[0]} samples, d={d}")
 
-# Euclidean baseline
-w_euclidean = np.exp(0.5*np.log(2)+gammaln((d+1)/2)-gammaln(d/2))
-print(f"w(B_2^{d}) = {w_euclidean:.4f}")
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-dir", type=Path, default=Path("mnist_data"))
+    p.add_argument("--outdir", type=Path, default=Path("results/exp2"))
+    p.add_argument("--quick", action="store_true", help="Small smoke-test run; do not use its numbers in the paper.")
+    return p.parse_args()
 
-# ─────────────────────────────────────────────────────────────────
-# 2.  Helpers
-# ─────────────────────────────────────────────────────────────────
-def sigmoid(z):
-    return 1./(1.+np.exp(-np.clip(z,-500,500)))
 
-def compute_fisher(X, theta):
-    p_ = sigmoid(X@theta); w_ = p_*(1-p_)
-    return (X*w_[:,None]).T@X/len(X)
-
-def matrix_sqrt_full(G, eps=1e-10):
-    ev,evec = np.linalg.eigh(G)
-    return evec@np.diag(np.sqrt(np.maximum(ev,eps)))@evec.T
-
-def mc_width(G_half, B, rng):
-    g = rng.standard_normal((G_half.shape[0], B))
-    return np.linalg.norm(G_half@g, axis=0).mean()
-
-def rank_k_sqrt(eigvals, eigvecs, k, eps=1e-10):
-    """G_k^{1/2}: keep top-k eigenvalues, zero the rest."""
-    lk = eigvals.copy()
-    lk[:-k] = 0.0   # eigvalsh returns ascending order
-    return eigvecs @ np.diag(np.sqrt(np.maximum(lk,0.))) @ eigvecs.T
-
-def train_logistic(Xtr_s, ytr, lam):
-    C = 1./(lam*len(Xtr_s)) if lam>0 else 1e8
-    clf = LogisticRegression(C=C, max_iter=2000, solver='lbfgs',
-                             random_state=0, tol=1e-6)
-    clf.fit(Xtr_s, ytr)
-    return clf.coef_.flatten()
-
-scaler = StandardScaler()
-
-# ─────────────────────────────────────────────────────────────────
-# 3.  Compute reference Fisher matrix and width (large n, many seeds)
-# ─────────────────────────────────────────────────────────────────
-print("\n--- Computing reference (n=10000, 10 seeds) ---")
-G_ref_list  = []
-wF_ref_list = []
-
-for si in range(N_SEEDS):
-    rng = np.random.default_rng(MASTER_SEED + si*100)
-    idx = rng.permutation(len(X_bin))
-    Xtr_s = scaler.fit_transform(X_bin[idx[:N_TRAIN_REF]])
-    ytr   = y_bin[idx[:N_TRAIN_REF]]
-    theta = train_logistic(Xtr_s, ytr, LAM_FIX)
-    G     = compute_fisher(Xtr_s, theta)
-    Gh    = matrix_sqrt_full(G)
-    wF_ref_list.append(mc_width(Gh, B_MC, rng))
-    G_ref_list.append(G)
-
-wF_ref    = np.mean(wF_ref_list)
-wF_ref_std= np.std(wF_ref_list)
-G_ref     = np.mean(G_ref_list, axis=0)   # average Fisher as stable reference
-print(f"Reference wF = {wF_ref:.6f} ± {wF_ref_std:.6f}")
-
-# Eigendecomposition of reference G (used for rank-k experiment)
-eigvals_ref, eigvecs_ref = np.linalg.eigh(G_ref)
-# eigvalsh returns ascending order; top eigenvalues are at the end
-print(f"Top-5 eigenvalues: {eigvals_ref[-5:][::-1]}")
-print(f"lambda_{{k+1}} at k=10: {eigvals_ref[-(10+1)]:.6f}")
-
-# ─────────────────────────────────────────────────────────────────
-# 4.  Sub-experiment 2.1: Rank-k approximation
-#     Validate: |wF - wF_k| <= sqrt(lambda_{k+1}) * w(T)
-# ─────────────────────────────────────────────────────────────────
-print("\n--- Sub-exp 2.1: Rank-k approximation ---")
-print(f"{'k':>6}  {'wF_k mean':>10}  {'|wF-wF_k|':>12}  "
-      f"{'sqrt(lam_k+1)':>14}  {'bound':>12}  {'ratio':>8}")
-print("-"*70)
-
-wF_k_all     = np.zeros((len(RANKS), N_SEEDS))
-error_k_all  = np.zeros((len(RANKS), N_SEEDS))
-bound_k_all  = np.zeros((len(RANKS), N_SEEDS))
-sqrt_lam_all = np.zeros(len(RANKS))
-
-for ki, k in enumerate(RANKS):
-    Gh_k = rank_k_sqrt(eigvals_ref, eigvecs_ref, k)
-    # lambda_{k+1} in ascending order: index d-k-1
-    idx_kp1 = d - k - 1
-    lam_kp1 = eigvals_ref[idx_kp1] if idx_kp1 >= 0 else 0.0
-    sqrt_lam_all[ki] = np.sqrt(max(lam_kp1, 0.))
-
-    for si in range(N_SEEDS):
-        rng = np.random.default_rng(MASTER_SEED + si*100 + 10)
-        wF_k_all[ki, si] = mc_width(Gh_k, B_MC, rng)
-        error_k_all[ki, si] = abs(wF_k_all[ki, si] - wF_ref_list[si])
-        bound_k_all[ki, si] = sqrt_lam_all[ki] * w_euclidean
-
-    em = error_k_all[ki].mean(); es = error_k_all[ki].std()
-    bm = bound_k_all[ki].mean()
-    wm = wF_k_all[ki].mean()
-    ratio = em/bm if bm>1e-10 else np.nan
-    print(f"{k:>6}  {wm:>10.4f}  {em:>10.4f}±{es:<6.4f}  "
-          f"{sqrt_lam_all[ki]:>14.6f}  {bm:>12.6f}  {ratio:>8.4f}")
-
-# Check: bound always satisfied?
-violations_21 = (error_k_all - bound_k_all).max()
-print(f"\nMax(error - bound) = {violations_21:.6f}"
-      + ("  OK (bound satisfied)" if violations_21<=1e-4 else "  VIOLATED"))
-
-# ─────────────────────────────────────────────────────────────────
-# 5.  Sub-experiment 2.2: Data convergence
-#     Validate: |wF_n - wF_ref| scales as O(1/sqrt(n))
-# ─────────────────────────────────────────────────────────────────
-print("\n--- Sub-exp 2.2: Data convergence ---")
-print(f"{'n':>8}  {'wF_n mean':>10}  {'|wF_n-wF_ref|':>14}  "
-      f"{'rel_err%':>10}  {'n/d':>6}")
-print("-"*55)
-
-wF_n_all    = np.zeros((len(N_VALUES), N_SEEDS))
-error_n_all = np.zeros((len(N_VALUES), N_SEEDS))
-
-for ni, n in enumerate(N_VALUES):
-    t0 = time.time()
-    for si in range(N_SEEDS):
-        rng = np.random.default_rng(MASTER_SEED + si*100 + 20)
-        idx = rng.permutation(len(X_bin))
-        # Use only n samples
-        Xtr_s = scaler.fit_transform(X_bin[idx[:n]])
-        ytr   = y_bin[idx[:n]]
-
-        # Need enough samples to fit logistic; skip if n < d/10
-        if n < 100:
-            wF_n_all[ni, si]    = np.nan
-            error_n_all[ni, si] = np.nan
+def ensure_mnist(data_dir: Path):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for filename in MNIST_FILES:
+        path = data_dir / filename
+        if path.exists():
             continue
+        url = f"{MNIST_BASE_URL}/{filename}"
+        print(f"Downloading {url} -> {path}")
+        urllib.request.urlretrieve(url, path)
 
-        theta = train_logistic(Xtr_s, ytr, LAM_FIX)
-        G_n   = compute_fisher(Xtr_s, theta)
-        Gh_n  = matrix_sqrt_full(G_n)
-        wF_n  = mc_width(Gh_n, B_MC, rng)
-        wF_n_all[ni, si]    = wF_n
-        error_n_all[ni, si] = abs(wF_n - wF_ref)
 
-    em = np.nanmean(error_n_all[ni])
-    es = np.nanstd(error_n_all[ni])
-    wm = np.nanmean(wF_n_all[ni])
-    rel= em/wF_ref*100
-    print(f"{n:>8}  {wm:>10.4f}  {em:>12.4f}±{es:<6.4f}  "
-          f"{rel:>9.2f}%  {n/d:>6.2f}  [{time.time()-t0:.1f}s]")
+def read_idx(path: Path) -> np.ndarray:
+    with gzip.open(path, "rb") as f:
+        magic = struct.unpack(">I", f.read(4))[0]
+        n = struct.unpack(">I", f.read(4))[0]
+        if magic == 2051:
+            rows, cols = struct.unpack(">II", f.read(8))
+            return np.frombuffer(f.read(), np.uint8).reshape(n, rows * cols).astype(np.float64)
+        if magic == 2049:
+            return np.frombuffer(f.read(), np.uint8).astype(int)
+    raise ValueError(f"Unknown IDX file: {path}")
 
-# Fit O(1/sqrt(n)) to data convergence
-valid = ~np.isnan(error_n_all.mean(1))
-Nv    = np.array(N_VALUES)[valid].astype(float)
-ev    = error_n_all[valid].mean(1)
-# Log-log regression: log(e) = a - 0.5*log(n) + b
-log_n = np.log(Nv); log_e = np.log(ev)
-coeffs = np.polyfit(log_n, log_e, 1)
-print(f"\nLog-log slope (expect -0.5): {coeffs[0]:.3f}")
 
-# ─────────────────────────────────────────────────────────────────
-# 6.  Sub-experiment 2.3: Structured approximations
-#     Compare: full Fisher vs diagonal vs score upper bound
-# ─────────────────────────────────────────────────────────────────
-print("\n--- Sub-exp 2.3: Structured approximations ---")
-print(f"{'seed':>6}  {'wF_full':>10}  {'wF_diag':>10}  "
-      f"{'scoreUB':>10}  {'err_diag%':>10}  {'err_score%':>11}")
-print("-"*60)
+def load_binary_mnist(data_dir: Path):
+    ensure_mnist(data_dir)
+    X = np.concatenate([
+        read_idx(data_dir / "train-images-idx3-ubyte.gz"),
+        read_idx(data_dir / "t10k-images-idx3-ubyte.gz"),
+    ])
+    y = np.concatenate([
+        read_idx(data_dir / "train-labels-idx1-ubyte.gz"),
+        read_idx(data_dir / "t10k-labels-idx1-ubyte.gz"),
+    ])
+    mask = (y == 0) | (y == 1)
+    return X[mask], y[mask]
 
-wF_full_all  = np.zeros(N_SEEDS)
-wF_diag_all  = np.zeros(N_SEEDS)
-wF_score_all = np.zeros(N_SEEDS)
 
-for si in range(N_SEEDS):
-    rng = np.random.default_rng(MASTER_SEED + si*100 + 30)
-    idx = rng.permutation(len(X_bin))
-    Xtr_s = scaler.fit_transform(X_bin[idx[:N_TRAIN_REF]])
-    ytr   = y_bin[idx[:N_TRAIN_REF]]
-    theta = train_logistic(Xtr_s, ytr, LAM_FIX)
-    G     = compute_fisher(Xtr_s, theta)
+def euclidean_ball_width(d: int) -> float:
+    return float(np.exp(0.5 * np.log(2.0) + gammaln((d + 1) / 2.0) - gammaln(d / 2.0)))
 
-    # Full Fisher width
-    Gh_full       = matrix_sqrt_full(G)
-    wF_full_all[si] = mc_width(Gh_full, B_MC, rng)
 
-    # Diagonal Fisher width
-    dG            = np.diag(G)
-    dh            = np.sqrt(np.maximum(dG, 1e-10))
-    g_diag        = rng.standard_normal((d, B_MC))
-    wF_diag_all[si] = np.linalg.norm(dh[:,None]*g_diag, axis=0).mean()
+def logistic_C(lam: float, n: int) -> float:
+    return 1.0 / (lam * n) if lam > 0 else 1e12
 
-    # Score upper bound: sqrt(Tr(G))
-    wF_score_all[si] = np.sqrt(np.trace(G))
 
-for si in range(N_SEEDS):
-    ref = wF_full_all[si]
-    print(f"{si:>6}  {wF_full_all[si]:>10.4f}  {wF_diag_all[si]:>10.4f}  "
-          f"{wF_score_all[si]:>10.4f}  "
-          f"{abs(wF_diag_all[si]-ref)/ref*100:>9.2f}%  "
-          f"{abs(wF_score_all[si]-ref)/ref*100:>10.2f}%")
+def fit_logistic(X: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
+    clf = LogisticRegression(
+        C=logistic_C(lam, len(X)),
+        max_iter=2000,
+        solver="lbfgs",
+        fit_intercept=False,
+        random_state=0,
+        tol=1e-6,
+    )
+    clf.fit(X, y)
+    return clf.coef_.ravel()
 
-print(f"\nSummary (mean ± std over {N_SEEDS} seeds):")
-print(f"  Full Fisher:    {wF_full_all.mean():.4f} ± {wF_full_all.std():.4f}")
-print(f"  Diagonal:       {wF_diag_all.mean():.4f} ± {wF_diag_all.std():.4f}  "
-      f"(err={abs(wF_diag_all-wF_full_all).mean()/wF_full_all.mean()*100:.2f}%)")
-print(f"  Score UB:       {wF_score_all.mean():.4f} ± {wF_score_all.std():.4f}  "
-      f"(err={abs(wF_score_all-wF_full_all).mean()/wF_full_all.mean()*100:.2f}%)")
 
-# ─────────────────────────────────────────────────────────────────
-# 7.  Save
-# ─────────────────────────────────────────────────────────────────
-np.savez('results/exp2_results.npz',
-         ranks=RANKS, n_values=N_VALUES,
-         wF_ref=wF_ref, wF_ref_std=wF_ref_std,
-         wF_k=wF_k_all, error_k=error_k_all, bound_k=bound_k_all,
-         sqrt_lam=sqrt_lam_all,
-         wF_n=wF_n_all, error_n=error_n_all,
-         wF_full=wF_full_all, wF_diag=wF_diag_all, wF_score=wF_score_all,
-         w_euclidean=w_euclidean, d=d, lam_fix=LAM_FIX,
-         loglog_slope=coeffs[0])
+def conditional_fisher_binary(X: np.ndarray, theta: np.ndarray) -> np.ndarray:
+    z = X @ theta
+    p = 1.0 / (1.0 + np.exp(-np.clip(z, -500, 500)))
+    q = p * (1.0 - p)
+    G = (X * q[:, None]).T @ X / len(X)
+    return 0.5 * (G + G.T)
 
-# ─────────────────────────────────────────────────────────────────
-# 8.  Summary text
-# ─────────────────────────────────────────────────────────────────
-lines = [
-    "="*70,
-    "Experiment 2: Estimator Accuracy and Stability",
-    f"Model: Binary Logistic, MNIST 0 vs 1, lambda={LAM_FIX}",
-    f"d={d}, n_ref={N_TRAIN_REF}, seeds={N_SEEDS}, B_MC={B_MC}",
-    f"Reference wF = {wF_ref:.6f} ± {wF_ref_std:.6f}",
-    f"w(B_2^d) = {w_euclidean:.6f}",
-    "="*70,
-    "",
-    "--- 2.1 Rank-k Approximation ---",
-    f"Corollary 3.2: |w_G(T) - w_{{G_k}}(T)| <= sqrt(lambda_{{k+1}}) * w(T)",
-    f"{'k':>6}  {'error mean':>12}  {'bound':>12}  {'ratio e/b':>10}  {'bound OK?':>10}",
-    "-"*55,
-]
-for ki, k in enumerate(RANKS):
-    em = error_k_all[ki].mean()
-    bm = bound_k_all[ki].mean()
-    ratio = em/bm if bm>1e-10 else np.nan
-    ok = "YES" if em <= bm+1e-4 else "NO"
-    lines.append(f"{k:>6}  {em:>12.6f}  {bm:>12.6f}  {ratio:>10.4f}  {ok:>10}")
 
-lines += [
-    "",
-    f"Max(error - bound) = {violations_21:.6f}"
-    + ("  [bound satisfied]" if violations_21<=1e-4 else "  [VIOLATED]"),
-    "",
-    "--- 2.2 Data Convergence ---",
-    f"Rate: log-log slope = {coeffs[0]:.3f}  (expect approx -0.5)",
-    f"{'n':>8}  {'wF_n mean':>10}  {'abs_error':>10}  {'rel_err%':>10}  {'n/d':>6}",
-    "-"*48,
-]
-for ni, n in enumerate(N_VALUES):
-    em  = np.nanmean(error_n_all[ni])
-    wm  = np.nanmean(wF_n_all[ni])
-    rel = em/wF_ref*100
-    lines.append(f"{n:>8}  {wm:>10.4f}  {em:>10.4f}  {rel:>9.2f}%  {n/d:>6.2f}")
+def sqrt_psd(G: np.ndarray, eigvals=None, eigvecs=None) -> np.ndarray:
+    if eigvals is None or eigvecs is None:
+        eigvals, eigvecs = np.linalg.eigh(G)
+    eigvals = np.clip(eigvals, 0.0, None)
+    return (eigvecs * np.sqrt(eigvals)[None, :]) @ eigvecs.T
 
-lines += [
-    "",
-    "--- 2.3 Structured Approximations ---",
-    f"{'Method':>15}  {'wF mean':>10}  {'±std':>8}  {'err vs full':>12}",
-    "-"*50,
-    f"{'Full Fisher':>15}  {wF_full_all.mean():>10.4f}  "
-    f"{wF_full_all.std():>8.4f}  {'(reference)':>12}",
-    f"{'Diagonal':>15}  {wF_diag_all.mean():>10.4f}  "
-    f"{wF_diag_all.std():>8.4f}  "
-    f"{abs(wF_diag_all-wF_full_all).mean()/wF_full_all.mean()*100:>10.2f}%",
-    f"{'Score UB':>15}  {wF_score_all.mean():>10.4f}  "
-    f"{wF_score_all.std():>8.4f}  "
-    f"{abs(wF_score_all-wF_full_all).mean()/wF_full_all.mean()*100:>10.2f}%",
-    "="*70,
-]
-summary = "\n".join(lines)
-print("\n"+summary)
-with open('results/exp2_summary.txt','w') as f:
-    f.write(summary)
 
-# ─────────────────────────────────────────────────────────────────
-# 9.  Figure — 3 panels
-# ─────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
-plt.subplots_adjust(wspace=0.38)
+def width_from_spectrum(eigvals: np.ndarray, z2: np.ndarray) -> float:
+    eigvals = np.clip(np.asarray(eigvals, dtype=float), 0.0, None)
+    return float(np.sqrt(z2 @ eigvals).mean())
 
-# ── Panel (a): Rank-k error vs sqrt(lambda_{k+1}) ────────────────
-ax = axes[0]
-em = error_k_all.mean(1);  es = error_k_all.std(1)
-bm = bound_k_all.mean(1)
-sl = sqrt_lam_all
 
-# x-axis: sqrt(lambda_{k+1})
-ax.errorbar(sl, em, yerr=es, fmt='o', color='steelblue',
-            capsize=3, lw=1.6, ms=5, label='Actual error $|w_F - w_{F,k}|$')
-ax.plot(sl, bm, 's--', color='tomato', lw=1.4, ms=5,
-        label=r'Bound $\sqrt{\lambda_{k+1}}\cdot w(T)$')
+def rankk_widths_from_desc_spectrum(eig_desc: np.ndarray, ranks, B: int, rng, batch: int = 1000):
+    """Use common Gaussian draws to estimate full and nested top-k widths."""
+    eig_desc = np.clip(np.asarray(eig_desc, dtype=float), 0.0, None)
+    ranks = list(ranks)
+    sums = {k: 0.0 for k in ranks}
+    full_sum = 0.0
+    done = 0
+    while done < B:
+        m = min(batch, B - done)
+        z2 = rng.standard_normal((m, eig_desc.size)) ** 2
+        cum = np.cumsum(z2 * eig_desc[None, :], axis=1)
+        full_sum += np.sqrt(cum[:, -1]).sum()
+        for k in ranks:
+            sums[k] += np.sqrt(cum[:, k - 1]).sum()
+        done += m
+    return full_sum / B, {k: sums[k] / B for k in ranks}
 
-# Annotate selected k values
-for ki, k in enumerate(RANKS):
-    if k in [1, 5, 20, 100, 392]:
-        ax.annotate(f'k={k}', xy=(sl[ki], em[ki]),
-                    xytext=(sl[ki]*1.05, em[ki]*1.15),
-                    fontsize=6.5, color='steelblue')
 
-ax.set_xlabel(r'$\sqrt{\lambda_{k+1}(\hat G)}$', fontsize=10)
-ax.set_ylabel(r'$|\hat w_F - \hat w_{F,k}|$', fontsize=10)
-ax.set_title('(a) Rank-$k$ approximation error\n'
-             r'vs $\sqrt{\lambda_{k+1}}$ (Corollary 3.2)', fontsize=9)
-ax.legend(fontsize=8)
-ax.set_xscale('log'); ax.set_yscale('log')
+def mc_width_from_spectrum(eigvals: np.ndarray, B: int, rng, batch: int = 1000) -> float:
+    eigvals = np.clip(np.asarray(eigvals, dtype=float), 0.0, None)
+    total = 0.0
+    done = 0
+    while done < B:
+        m = min(batch, B - done)
+        z2 = rng.standard_normal((m, eigvals.size)) ** 2
+        total += np.sqrt(z2 @ eigvals).sum()
+        done += m
+    return float(total / B)
 
-# ── Panel (b): Data convergence ───────────────────────────────────
-ax = axes[1]
-valid  = ~np.isnan(error_n_all.mean(1))
-Nv     = np.array(N_VALUES)[valid].astype(float)
-em_n   = error_n_all[valid].mean(1)
-es_n   = error_n_all[valid].std(1)
 
-ax.errorbar(Nv, em_n, yerr=es_n, fmt='o-', color='steelblue',
-            capsize=3, lw=1.6, ms=5, label='$|\\hat w_F^{(n)} - w_F^{\\rm ref}|$')
+def operator_norm_symmetric(A: np.ndarray) -> float:
+    vals = np.linalg.eigvalsh(0.5 * (A + A.T))
+    return float(np.max(np.abs(vals)))
 
-# O(1/sqrt(n)) reference anchored at largest n
-ref_n = em_n[-1] * np.sqrt(Nv[-1]/Nv)
-ax.plot(Nv, ref_n, 'k--', lw=1.3,
-        label=r'$O(1/\sqrt{n})$ reference')
 
-# Annotate slope
-ax.text(0.35, 0.72,
-        f'Log-log slope\n= {coeffs[0]:.2f}\n(expect $-0.5$)',
-        transform=ax.transAxes, fontsize=8.5,
-        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.6))
+def write_csv(path: Path, rows):
+    rows = list(rows)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
-ax.set_xscale('log'); ax.set_yscale('log')
-ax.set_xlabel('Training samples $n$', fontsize=10)
-ax.set_ylabel(r'$|\hat w_F^{(n)} - w_F^{\rm ref}|$', fontsize=10)
-ax.set_title('(b) Data convergence\n'
-             r'(Corollary 3.4: $\varepsilon_n \to 0$)', fontsize=9)
-ax.legend(fontsize=8)
 
-# ── Panel (c): Structured approximations ─────────────────────────
-ax = axes[2]
-methods = ['Full Fisher', 'Diagonal', 'Score UB\n$\\sqrt{\\rm Tr}(G)$']
-means   = [wF_full_all.mean(), wF_diag_all.mean(), wF_score_all.mean()]
-stds    = [wF_full_all.std(),  wF_diag_all.std(),  wF_score_all.std()]
-colors  = ['steelblue', 'darkorange', 'tomato']
-x_pos   = np.arange(3)
+def run(args):
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    X_bin, y_bin = load_binary_mnist(args.data_dir)
+    d = X_bin.shape[1]
+    wE = euclidean_ball_width(d)
 
-bars = ax.bar(x_pos, means, yerr=stds, color=colors, alpha=0.75,
-              capsize=5, error_kw={'lw':1.5})
-ax.set_xticks(x_pos); ax.set_xticklabels(methods, fontsize=9)
-ax.set_ylabel(r'$\hat w_F(B_2^d;\hat\theta)$', fontsize=10)
-ax.set_title('(c) Structured Fisher approximations\n'
-             '(Theorem 3.3: stability under metric error)', fontsize=9)
-ax.set_ylim(0, max(means)*1.25)
+    if args.quick:
+        n_seeds = 2
+        n_ref = 1500
+        ranks = [1, 5, 20, 100]
+        n_values = [100, 300, 800, 1500]
+        B_rank = 2500
+        B_width = 1200
+        print("QUICK MODE: outputs are only for a smoke test, not for the manuscript.")
+    else:
+        n_seeds = 10
+        n_ref = 10_000
+        ranks = RANKS
+        n_values = N_VALUES
+        B_rank = 20_000
+        B_width = 5_000
 
-# Annotate error percentages
-err_diag  = abs(wF_diag_all-wF_full_all).mean()/wF_full_all.mean()*100
-err_score = abs(wF_score_all-wF_full_all).mean()/wF_full_all.mean()*100
-ax.text(1, means[1]+stds[1]+0.01,
-        f'+{err_diag:.1f}%', ha='center', fontsize=8.5, color='darkorange')
-ax.text(2, means[2]+stds[2]+0.01,
-        f'+{err_score:.1f}%', ha='center', fontsize=8.5, color='tomato')
-ax.axhline(means[0], ls=':', color='steelblue', lw=1.2, alpha=0.7)
+    scaler = StandardScaler()
 
-fig.suptitle(
-    'Experiment 2: Estimator Accuracy and Stability\n'
-    r'Binary Logistic, MNIST 0 vs 1, $n=10{,}000$, $d=784$, '
-    f'$\\lambda={LAM_FIX}$, {N_SEEDS} seeds',
-    fontsize=10, y=1.02)
+    # ================================================================
+    # 2.1 Rank-k approximation: SAME G within each seed.
+    # ================================================================
+    print("\n--- 2.1 Rank-k approximation on the same matrix ---")
+    rank_errors = np.zeros((len(ranks), n_seeds))
+    rank_bounds = np.zeros((len(ranks), n_seeds))
+    rank_width_full = np.zeros(n_seeds)
+    rank_width_k = np.zeros((len(ranks), n_seeds))
+    rank_lambda_kp1 = np.zeros((len(ranks), n_seeds))
 
-for fmt in ('pdf','png'):
-    plt.savefig(f'results/exp2_figure.{fmt}',
-                bbox_inches='tight', dpi=150 if fmt=='png' else None)
+    seed_G = []
+    seed_eigh = []
 
-print("\nSaved: results/exp2_figure.png  .pdf")
-print("Saved: results/exp2_summary.txt")
-print("Saved: results/exp2_results.npz")
-print("\nDone. Send exp2_figure.png and exp2_summary.txt.")
+    for si in range(n_seeds):
+        rng_data = np.random.default_rng(MASTER_SEED + 100 * si)
+        idx = rng_data.permutation(len(X_bin))
+        Xtr = scaler.fit_transform(X_bin[idx[:n_ref]])
+        ytr = y_bin[idx[:n_ref]]
+        theta = fit_logistic(Xtr, ytr, LAM_FIX)
+        G = conditional_fisher_binary(Xtr, theta)
+        eigvals, eigvecs = np.linalg.eigh(G)
+        eigvals = np.clip(eigvals, 0.0, None)
+        eig_desc = eigvals[::-1]
+        seed_G.append(G)
+        seed_eigh.append((eigvals, eigvecs))
+
+        full_w, k_widths = rankk_widths_from_desc_spectrum(
+            eig_desc, ranks, B_rank, np.random.default_rng(MASTER_SEED + 10_000 + si)
+        )
+        rank_width_full[si] = full_w
+        for ki, k in enumerate(ranks):
+            wk = k_widths[k]
+            lam_kp1 = eig_desc[k] if k < d else 0.0
+            bound = np.sqrt(max(lam_kp1, 0.0)) * wE
+            rank_width_k[ki, si] = wk
+            rank_errors[ki, si] = full_w - wk  # nonnegative for Euclidean balls/truncation
+            rank_lambda_kp1[ki, si] = lam_kp1
+            rank_bounds[ki, si] = bound
+
+    rank_rows = []
+    for ki, k in enumerate(ranks):
+        rank_rows.append({
+            "k": k,
+            "error_mean": rank_errors[ki].mean(),
+            "error_std": rank_errors[ki].std(),
+            "bound_mean": rank_bounds[ki].mean(),
+            "bound_std": rank_bounds[ki].std(),
+            "sqrt_lambda_kp1_mean": np.sqrt(rank_lambda_kp1[ki]).mean(),
+            "max_seed_error_minus_bound": np.max(rank_errors[ki] - rank_bounds[ki]),
+        })
+    write_csv(args.outdir / "exp2_rankk.csv", rank_rows)
+    max_rank_violation = float(np.max(rank_errors - rank_bounds))
+    print(f"Max seed-wise MC(error - theoretical bound) = {max_rank_violation:.6g}")
+
+    # ================================================================
+    # 2.2 Fixed-base-point empirical convergence.
+    # ================================================================
+    print("\n--- 2.2 Fixed-base-point convergence diagnostic ---")
+    # Fit theta_ref once on one fixed reference training subset.
+    rng_ref = np.random.default_rng(MASTER_SEED + 500_000)
+    perm_ref = rng_ref.permutation(len(X_bin))
+    train_idx = perm_ref[:n_ref]
+    X_train_raw = X_bin[train_idx]
+    y_train = y_bin[train_idx]
+    scaler_ref = StandardScaler().fit(X_train_raw)
+    X_train = scaler_ref.transform(X_train_raw)
+    theta_ref = fit_logistic(X_train, y_train, LAM_FIX)
+
+    # Keep theta_ref and the coordinate system fixed. Use all available binary
+    # covariates as a large-sample empirical target for the conditional Fisher.
+    X_pool = scaler_ref.transform(X_bin)
+    G_target = conditional_fisher_binary(X_pool, theta_ref)
+    eig_target = np.linalg.eigvalsh(G_target)
+    rng_width_common = np.random.default_rng(MASTER_SEED + 600_000)
+    z2_common = rng_width_common.standard_normal((B_width, d)) ** 2
+    w_target = width_from_spectrum(eig_target, z2_common)
+
+    conv_widths = np.zeros((len(n_values), n_seeds))
+    conv_errors = np.zeros((len(n_values), n_seeds))
+    conv_metric_errors = np.zeros((len(n_values), n_seeds))
+
+    for ni, n in enumerate(n_values):
+        for si in range(n_seeds):
+            rng = np.random.default_rng(MASTER_SEED + 700_000 + 1000 * ni + si)
+            idx = rng.choice(len(X_pool), size=n, replace=False)
+            G_n = conditional_fisher_binary(X_pool[idx], theta_ref)
+            eig_n = np.linalg.eigvalsh(G_n)
+            w_n = width_from_spectrum(eig_n, z2_common)
+            conv_widths[ni, si] = w_n
+            conv_errors[ni, si] = abs(w_n - w_target)
+            conv_metric_errors[ni, si] = operator_norm_symmetric(G_n - G_target)
+
+    # Log-log descriptive slope.
+    mean_err = conv_errors.mean(axis=1)
+    positive = mean_err > 0
+    slope = float(np.polyfit(np.log(np.asarray(n_values, float)[positive]), np.log(mean_err[positive]), 1)[0])
+
+    conv_rows = []
+    for ni, n in enumerate(n_values):
+        conv_rows.append({
+            "n": n,
+            "w_mean": conv_widths[ni].mean(),
+            "w_std": conv_widths[ni].std(),
+            "abs_width_error_mean": conv_errors[ni].mean(),
+            "abs_width_error_std": conv_errors[ni].std(),
+            "metric_op_error_mean": conv_metric_errors[ni].mean(),
+            "metric_op_error_std": conv_metric_errors[ni].std(),
+            "n_over_d": n / d,
+        })
+    write_csv(args.outdir / "exp2_convergence.csv", conv_rows)
+    print(f"Fixed-base-point width-error log-log slope = {slope:.3f}")
+
+    # ================================================================
+    # 2.3 Structured approximation: full vs diagonal + stability bound.
+    # ================================================================
+    print("\n--- 2.3 Structured approximation ---")
+    full_widths = np.zeros(n_seeds)
+    diag_widths = np.zeros(n_seeds)
+    trace_uppers = np.zeros(n_seeds)
+    diag_errors = np.zeros(n_seeds)
+    stability_bounds = np.zeros(n_seeds)
+
+    for si in range(n_seeds):
+        G = seed_G[si]
+        eigvals, eigvecs = seed_eigh[si]
+        # Reuse a common isotropic Gaussian table for full and diagonal widths.
+        rng = np.random.default_rng(MASTER_SEED + 800_000 + si)
+        z2 = rng.standard_normal((B_width, d)) ** 2
+        full_w = width_from_spectrum(eigvals, z2)
+        dG = np.clip(np.diag(G), 0.0, None)
+        diag_w = width_from_spectrum(dG, z2)
+        trub = float(np.sqrt(np.trace(G)))
+
+        Ghalf = sqrt_psd(G, eigvals, eigvecs)
+        Dhalf = np.diag(np.sqrt(dG))
+        stab = operator_norm_symmetric(Ghalf - Dhalf) * wE
+
+        full_widths[si] = full_w
+        diag_widths[si] = diag_w
+        trace_uppers[si] = trub
+        diag_errors[si] = abs(diag_w - full_w)
+        stability_bounds[si] = stab
+
+    struct_rows = []
+    for si in range(n_seeds):
+        struct_rows.append({
+            "seed": si,
+            "full_conditional_fisher_width": full_widths[si],
+            "diagonal_conditional_fisher_width": diag_widths[si],
+            "trace_upper_scale": trace_uppers[si],
+            "diagonal_abs_error": diag_errors[si],
+            "theorem_3_1_stability_bound": stability_bounds[si],
+            "bound_satisfied": bool(diag_errors[si] <= stability_bounds[si] + 1e-10),
+        })
+    write_csv(args.outdir / "exp2_structured.csv", struct_rows)
+
+    np.savez(
+        args.outdir / "exp2_results.npz",
+        ranks=np.asarray(ranks),
+        rank_errors=rank_errors,
+        rank_bounds=rank_bounds,
+        rank_width_full=rank_width_full,
+        rank_width_k=rank_width_k,
+        rank_lambda_kp1=rank_lambda_kp1,
+        n_values=np.asarray(n_values),
+        conv_widths=conv_widths,
+        conv_errors=conv_errors,
+        conv_metric_errors=conv_metric_errors,
+        conv_slope=slope,
+        w_target=w_target,
+        full_widths=full_widths,
+        diag_widths=diag_widths,
+        trace_uppers=trace_uppers,
+        diag_errors=diag_errors,
+        stability_bounds=stability_bounds,
+        w_euclidean=wE,
+        lambda_fixed=LAM_FIX,
+        n_ref=n_ref,
+        n_seeds=n_seeds,
+    )
+
+    summary = [
+        "Experiment 2: Estimator Accuracy and Stability",
+        f"Binary logistic, lambda={LAM_FIX}, d={d}, seeds={n_seeds}",
+        "Model matrix = full conditional model Fisher averaged over observed covariates.",
+        "",
+        "2.1 Rank-k approximation (same G within every comparison):",
+        f"  max seed-wise MC(error - theoretical bound) = {max_rank_violation:.8f}",
+    ]
+    for row in rank_rows:
+        summary.append(
+            f"  k={row['k']}: error={row['error_mean']:.6f} +- {row['error_std']:.6f}; "
+            f"bound={row['bound_mean']:.6f} +- {row['bound_std']:.6f}"
+        )
+    summary += [
+        "",
+        "2.2 Fixed-base-point convergence diagnostic:",
+        f"  target width (large-sample empirical conditional Fisher) = {w_target:.6f}",
+        f"  log-log slope of mean |w_n-w_ref| vs n = {slope:.4f}",
+    ]
+    for row in conv_rows:
+        summary.append(
+            f"  n={row['n']}: width error={row['abs_width_error_mean']:.6f} +- {row['abs_width_error_std']:.6f}; "
+            f"metric op error={row['metric_op_error_mean']:.6f}"
+        )
+    summary += [
+        "",
+        "2.3 Structured approximation:",
+        f"  full conditional Fisher width = {full_widths.mean():.6f} +- {full_widths.std():.6f}",
+        f"  diagonal conditional Fisher width = {diag_widths.mean():.6f} +- {diag_widths.std():.6f}",
+        f"  trace upper scale = {trace_uppers.mean():.6f} +- {trace_uppers.std():.6f}",
+        f"  mean diagonal abs error = {diag_errors.mean():.6f}",
+        f"  mean Theorem 3.1 stability bound = {stability_bounds.mean():.6f}",
+        f"  all seed-wise stability bounds satisfied = {bool(np.all(diag_errors <= stability_bounds + 1e-10))}",
+    ]
+    (args.outdir / "exp2_summary.txt").write_text("\n".join(summary))
+
+    # ================================================================
+    # Figure 2 for the main paper: two panels.
+    #
+    # We intentionally omit the fixed-base-point convergence diagnostic
+    # from the main figure. The diagnostic is still computed and saved in
+    # exp2_convergence.csv / exp2_results.npz for reproducibility, but its
+    # observed slope is not used as a main-paper claim.
+    # ================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2))
+    plt.subplots_adjust(wspace=0.34)
+
+    # ---------------------------------------------------------------
+    # (a) Rank-k approximation: observed error vs Proposition 6.1 bound.
+    # Each comparison uses the same G and its own rank-k truncation.
+    # ---------------------------------------------------------------
+    ax = axes[0]
+    x_rank = np.sqrt(rank_lambda_kp1).mean(axis=1)
+    err_m = rank_errors.mean(axis=1)
+    err_s = rank_errors.std(axis=1)
+    bnd_m = rank_bounds.mean(axis=1)
+    bnd_s = rank_bounds.std(axis=1)
+
+    ax.errorbar(
+        x_rank,
+        err_m,
+        yerr=err_s,
+        fmt="o-",
+        capsize=3,
+        lw=1.4,
+        markersize=4.5,
+        label=r"Observed $|w_{\widehat G}-w_{\widehat G_k}|$",
+    )
+    ax.errorbar(
+        x_rank,
+        bnd_m,
+        yerr=bnd_s,
+        fmt="s--",
+        capsize=3,
+        lw=1.3,
+        markersize=4.2,
+        label=r"Bound $\sqrt{\lambda_{k+1}(\widehat G)}\,w(T)$",
+    )
+
+    for ki, k in enumerate(ranks):
+        if k in [1, 10, 100, 392]:
+            ax.annotate(
+                f"$k={k}$",
+                xy=(x_rank[ki], err_m[ki]),
+                xytext=(6, 6),
+                textcoords="offset points",
+                fontsize=8,
+            )
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"Mean $\sqrt{\lambda_{k+1}(\widehat G)}$")
+    ax.set_ylabel(r"Rank-$k$ width error / upper bound")
+    ax.set_title("(a) Low-rank approximation\n(Proposition 6.1; same $G$)", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.18)
+
+    # ---------------------------------------------------------------
+    # (b) Structured approximation: full / diagonal / trace upper scale.
+    # Theorem 3.1 stability bounds are checked numerically and saved in
+    # exp2_structured.csv, but are too loose to display on this scale.
+    # ---------------------------------------------------------------
+    ax = axes[1]
+    labels = [
+        "Full conditional\nFisher",
+        "Diagonal\nconditional Fisher",
+        "Trace upper\nscale",
+    ]
+    means = np.array([
+        full_widths.mean(),
+        diag_widths.mean(),
+        trace_uppers.mean(),
+    ])
+    stds = np.array([
+        full_widths.std(),
+        diag_widths.std(),
+        trace_uppers.std(),
+    ])
+    x = np.arange(3)
+
+    ax.bar(x, means, yerr=stds, capsize=4, alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8.5)
+    ax.set_ylabel(r"$\widehat w_G(B_2^d)$ or upper scale")
+    ax.set_title("(b) Structured approximation", fontsize=9)
+
+    diag_pct = 100.0 * diag_errors.mean() / full_widths.mean()
+    trace_pct = 100.0 * (trace_uppers.mean() - full_widths.mean()) / full_widths.mean()
+    pad = 0.025 * means.max()
+
+    ax.text(
+        1,
+        means[1] + stds[1] + pad,
+        f"{diag_pct:.2f}% error",
+        ha="center",
+        va="bottom",
+        fontsize=8,
+    )
+    ax.text(
+        2,
+        means[2] + stds[2] + pad,
+        f"{trace_pct:.2f}% above full",
+        ha="center",
+        va="bottom",
+        fontsize=8,
+    )
+
+    ax.set_ylim(0, np.max(means + stds) * 1.20)
+    ax.grid(True, axis="y", alpha=0.18)
+
+    fig.suptitle(
+        rf"Experiment 2: Estimator Accuracy and Stability ($\lambda={LAM_FIX}$)",
+        fontsize=10,
+        y=1.02,
+    )
+    fig.savefig(args.outdir / "exp2_figure.pdf", bbox_inches="tight")
+    fig.savefig(args.outdir / "exp2_figure.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    print("\n" + "\n".join(summary))
+    print(f"\nSaved outputs to {args.outdir.resolve()}")
+
+
+if __name__ == "__main__":
+    run(parse_args())
