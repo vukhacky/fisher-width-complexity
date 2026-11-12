@@ -335,7 +335,7 @@ def run(args):
     ax.set_xticklabels([str(k) for k in ks], rotation=45, fontsize=7)
     ax.set_xlabel("Subspace dimension $k$")
     ax.set_ylabel("Width")
-    ax.set_title("(a) Same Euclidean width, different Fisher widths", fontsize=9)
+    ax.set_title("(a)", fontsize=9)
     ax.legend(fontsize=7)
 
     top_tr = np.asarray([r["top_trace_upper"] for r in summary_rows])
@@ -350,7 +350,7 @@ def run(args):
     ax.plot([0, mx], [0, mx], "--", label=r"$y=x$")
     ax.set_xlabel(r"Restricted trace upper scale $\sqrt{\mathrm{Tr}(P_V\widehat G P_V)}$")
     ax.set_ylabel(r"$\widehat w_G(T_V)$")
-    ax.set_title("(b) Fisher width versus restricted trace upper scale", fontsize=9)
+    ax.set_title("(b)", fontsize=9)
     ax.legend(fontsize=7)
 
     top_s = np.asarray([r["top_heldout_sensitivity"] for r in summary_rows])
@@ -367,10 +367,9 @@ def run(args):
     ax.set_xticklabels([str(k) for k in ks], rotation=45, fontsize=7)
     ax.set_xlabel("Subspace dimension $k$")
     ax.set_ylabel("Held-out loss sensitivity")
-    ax.set_title(r"(c) Held-out local sensitivity, $\varepsilon=0.02$", fontsize=9)
+    ax.set_title("(c)", fontsize=9)
     ax.legend(fontsize=7)
 
-    fig.suptitle("Experiment 3: Non-Spherical Perturbation Sets and Fisher Alignment", fontsize=10, y=1.02)
     fig.savefig(args.outdir / "exp3_figure.pdf", bbox_inches="tight")
     fig.savefig(args.outdir / "exp3_figure.png", dpi=180, bbox_inches="tight")
     plt.close(fig)

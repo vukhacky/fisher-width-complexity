@@ -504,7 +504,7 @@ def run(args):
     ax.set_yscale("log")
     ax.set_xlabel(r"Mean $\sqrt{\lambda_{k+1}(\widehat G)}$")
     ax.set_ylabel(r"Rank-$k$ width error / upper bound")
-    ax.set_title("(a) Low-rank approximation\n(Proposition 6.1; same $G$)", fontsize=9)
+    ax.set_title("(a)", fontsize=9)
     ax.legend(fontsize=8)
     ax.grid(True, which="both", alpha=0.18)
 
@@ -535,7 +535,7 @@ def run(args):
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=8.5)
     ax.set_ylabel(r"$\widehat w_G(B_2^d)$ or upper scale")
-    ax.set_title("(b) Structured approximation", fontsize=9)
+    ax.set_title("(b)", fontsize=9)
 
     diag_pct = 100.0 * diag_errors.mean() / full_widths.mean()
     trace_pct = 100.0 * (trace_uppers.mean() - full_widths.mean()) / full_widths.mean()
@@ -561,11 +561,6 @@ def run(args):
     ax.set_ylim(0, np.max(means + stds) * 1.20)
     ax.grid(True, axis="y", alpha=0.18)
 
-    fig.suptitle(
-        rf"Experiment 2: Estimator Accuracy and Stability ($\lambda={LAM_FIX}$)",
-        fontsize=10,
-        y=1.02,
-    )
     fig.savefig(args.outdir / "exp2_figure.pdf", bbox_inches="tight")
     fig.savefig(args.outdir / "exp2_figure.png", dpi=180, bbox_inches="tight")
     plt.close(fig)

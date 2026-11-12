@@ -146,7 +146,7 @@ def mc_width_from_spectrum(eigvals, B: int, rng, batch: int = 256) -> float:
 def spectral_stats(eigvals, wE: float, damp: float = DAMP):
     eigvals = np.clip(np.asarray(eigvals), 0.0, None)
     lmax = float(eigvals.max(initial=0.0))
-    lmin = float(eigvals.min(initial=0.0))
+    lmin = float(eigvals.min()) if eigvals.size else 0.0
     lower = np.sqrt(lmin) * wE
     upper = np.sqrt(lmax) * wE
     kappa = lmax / max(lmin, damp)
@@ -400,7 +400,7 @@ def run(args):
         ax.set_xticklabels(lambda_labels, fontsize=7)
         ax.set_xlabel(r"$\lambda$")
         ax.set_ylabel(r"$\widehat w_G(B_2^p)$")
-        ax.set_title(title + "\n(a) Absolute Fisher width", fontsize=8)
+        ax.set_title(title + "\n(a)", fontsize=8)
         ax.legend(fontsize=6)
         ax.set_ylim(bottom=0)
 
@@ -412,7 +412,7 @@ def run(args):
         ax.set_xticklabels(lambda_labels, fontsize=7)
         ax.set_xlabel(r"$\lambda$")
         ax.set_ylabel(r"$\widehat w_G / w(B_2^p)$")
-        ax.set_title("(b) Normalized Fisher width", fontsize=8)
+        ax.set_title("(b)", fontsize=8)
         ax.legend(fontsize=7)
         ax.set_ylim(0, 1.15)
         if key == "C":
@@ -425,7 +425,7 @@ def run(args):
             ax.set_xticklabels(lambda_labels, fontsize=7)
             ax.set_xlabel(r"$\lambda$")
             ax.set_ylabel(r"$\kappa_\varepsilon(G)$")
-            ax.set_title(r"(c) Spectral anisotropy $\kappa_\varepsilon(G)$", fontsize=8)
+            ax.set_title("(c)", fontsize=8)
             ax.set_yscale("log")
         else:
             Bv = np.asarray(B_values, dtype=float)
@@ -438,10 +438,9 @@ def run(args):
             ax.set_yscale("log")
             ax.set_xlabel(r"$B$ (Gaussian samples)")
             ax.set_ylabel("Relative MC error (%)")
-            ax.set_title("(c) Monte Carlo convergence", fontsize=8)
+            ax.set_title("(c)", fontsize=8)
             ax.legend(fontsize=7)
 
-    fig.suptitle("Experiment 1: Fisher Width in Trained Models", fontsize=11, y=1.01)
     fig.savefig(args.outdir / "exp1_figure.pdf", bbox_inches="tight")
     fig.savefig(args.outdir / "exp1_figure.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
